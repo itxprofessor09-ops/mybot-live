@@ -7,16 +7,18 @@ import traceback
 from kivy.app import App
 from kivy.clock import Clock
 from kivy.core.window import Window
+from kivy.graphics import Color, Rectangle
 from kivy.metrics import dp
 from kivy.uix.boxlayout import BoxLayout
 from kivy.uix.button import Button
+from kivy.uix.floatlayout import FloatLayout
 from kivy.uix.gridlayout import GridLayout
 from kivy.uix.label import Label
 from kivy.uix.scrollview import ScrollView
 from kivy.uix.textinput import TextInput
 from kivy.utils import escape_markup
 
-VERSION = "1.1"
+VERSION = "1.2"
 BRAND = "Eagle X bot"
 SOURCE = "bundled"
 LOAD_ERRORS = []
@@ -25,6 +27,9 @@ CRYPTO = ["BTC", "ETH", "BNB", "SOL", "XRP", "DOGE"]
 FX = ["EUR/USD", "GBP/USD", "USD/JPY", "AUD/USD", "USD/CAD", "USD/CHF", "EUR/JPY", "GBP/JPY"]
 TFS = {"5s": 5, "10s": 10, "15s": 15, "1m": 60, "5m": 300, "15m": 900}
 GREEN, RED, GREY = "26c281", "ef4b4b", "9aa3b5"
+TICKER_COINS = ["BTC", "ETH", "BNB", "SOL", "XRP", "DOGE", "ADA", "TRX", "AVAX", "LINK", "DOT", "LTC",
+                "BCH", "SHIB", "XLM", "ATOM", "NEAR", "UNI", "TON", "SUI", "PEPE"]
+TICKER_SPEED = 80  # pixels/second (dp), zyada = tez
 BINANCE_HOSTS = ["https://api.binance.com", "https://data-api.binance.vision"]
 
 
@@ -84,6 +89,37 @@ def fetch(pair, tf, key):
         raise Exception(d.get("message", "Data nahi mila"))
     return [{"o": float(k["open"]), "h": float(k["high"]), "l": float(k["low"]), "c": float(k["close"])}
             for k in reversed(d["values"])]
+
+
+# ---------------- live ticker ----------------
+def pfmt(x):
+    if x >= 1000:
+        return "{:,.2f}".format(x)
+    if x >= 1:
+        return "{:.3f}".format(x)
+    if x >= 0.01:
+        return "{:.4f}".format(x)
+    return "{:.8f}".format(x)
+
+
+def fetch_ticker(symbols):
+    syms = json.dumps([c + "USDT" for c in symbols], separators=(",", ":"))
+    d = binance("/api/v3/ticker/24hr", {"symbols": syms})
+    order = {c: i for i, c in enumerate(symbols)}
+    rows = [{"name": x["symbol"][:-4], "price": float(x["lastPrice"]),
+             "chg": float(x["priceChangePercent"])} for x in d]
+    rows.sort(key=lambda r: order.get(r["name"], 999))
+    return rows
+
+
+def ticker_text(rows):
+    parts = []
+    for r in rows:
+        ch = r["chg"]
+        col = GREEN if ch >= 0 else RED
+        parts.append("[b]%s[/b] %s [color=%s]%s%.2f%%[/color]"
+                     % (r["name"], pfmt(r["price"]), col, "+" if ch >= 0 else "", ch))
+    return "        |        ".join(parts)
 
 
 # ---------------- indicators ----------------
@@ -239,13 +275,77 @@ class SignalApp(App):
             nav.add_widget(btn("Live", lambda: self.set_mode("live"), h=54, bg=(0.09, 0.11, 0.15, 1)))
             nav.add_widget(btn("OTC", lambda: self.set_mode("otc"), h=54, bg=(0.09, 0.11, 0.15, 1)))
             nav.add_widget(btn("Settings", self.show_settings, h=54, bg=(0.09, 0.11, 0.15, 1)))
+            root.add_widget(self.make_ticker())
             root.add_widget(self.head)
             root.add_widget(self.body)
             root.add_widget(nav)
             self.set_mode("live")
+            Clock.schedule_interval(self.scroll, 1 / 30.0)
+            Clock.schedule_interval(lambda dt: self.ticker_job(), 10)
+            Clock.schedule_once(lambda dt: self.ticker_job(), 0.3)
+            threading.Thread(target=self.warmup, daemon=True).start()
             return root
         except Exception:
             return self.err_view(traceback.format_exc())
+
+    def make_ticker(self):
+        self.ticker_ok = False
+        self.ticker_busy = False
+        self.ticker_syms = list(TICKER_COINS)
+        box = FloatLayout(size_hint_y=None, height=dp(36))
+        with box.canvas.before:
+            Color(0.09, 0.11, 0.15, 1)
+            rect = Rectangle(pos=box.pos, size=box.size)
+        box.bind(pos=lambda i, v: setattr(rect, "pos", v), size=lambda i, v: setattr(rect, "size", v))
+        l = Label(text="Live prices load ho rahe hain...", markup=True, size_hint=(None, 1),
+                  halign="left", valign="middle", font_size=dp(15), text_size=(None, dp(36)))
+        l.bind(texture_size=lambda i, v: setattr(i, "width", v[0] + dp(30)))
+        box.bind(y=lambda i, v: setattr(l, "y", v))
+        l.x = Window.width
+        box.add_widget(l)
+        self.ticker_lbl = l
+        return box
+
+    def scroll(self, dt):
+        l = self.ticker_lbl
+        l.x -= dp(TICKER_SPEED) * dt
+        if l.x + l.width < 0:
+            l.x = Window.width
+
+    def ticker_job(self):
+        if self.ticker_busy:
+            return
+        self.ticker_busy = True
+        threading.Thread(target=self.ticker_fetch, daemon=True).start()
+
+    def ticker_fetch(self):
+        text = None
+        try:
+            try:
+                rows = fetch_ticker(self.ticker_syms)
+            except Exception:
+                allrows = binance("/api/v3/ticker/24hr", {})
+                valid = set(x["symbol"] for x in allrows)
+                self.ticker_syms = [c for c in self.ticker_syms if c + "USDT" in valid] or self.ticker_syms
+                rows = fetch_ticker(self.ticker_syms)
+            text = ticker_text(rows)
+        except Exception:
+            text = None
+        self.ticker_busy = False
+        Clock.schedule_once(lambda dt: self.set_ticker(text))
+
+    def set_ticker(self, text):
+        if text:
+            self.ticker_lbl.text = text
+            self.ticker_ok = True
+        elif not self.ticker_ok:
+            self.ticker_lbl.text = "Live prices: internet check karein"
+
+    def warmup(self):
+        try:
+            import requests  # noqa: F401
+        except Exception:
+            pass
 
     def err_view(self, text):
         sv = ScrollView()
