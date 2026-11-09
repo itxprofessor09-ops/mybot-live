@@ -1,4 +1,4 @@
-"""my_bot logic (online-updatable). Sirf signals deta hai, guarantee nahi."""
+"""Eagle X bot logic (online-updatable). Sirf signals deta hai, guarantee nahi."""
 import json
 import os
 import threading
@@ -16,7 +16,8 @@ from kivy.uix.scrollview import ScrollView
 from kivy.uix.textinput import TextInput
 from kivy.utils import escape_markup
 
-VERSION = "1.0"
+VERSION = "1.1"
+BRAND = "Eagle X bot"
 SOURCE = "bundled"
 LOAD_ERRORS = []
 
@@ -222,7 +223,7 @@ def btn(text, cb, h=56, bg=(0.14, 0.17, 0.24, 1)):
 
 
 class SignalApp(App):
-    title = "my_bot"
+    title = BRAND
 
     def build(self):
         try:
@@ -232,7 +233,7 @@ class SignalApp(App):
             self.mode, self.pair, self.tf, self.ev = "live", None, None, None
             self.auto_btn = None
             root = BoxLayout(orientation="vertical")
-            self.head = Label(text="my_bot", bold=True, size_hint_y=None, height=dp(50), font_size=dp(18))
+            self.head = Label(text=BRAND, bold=True, size_hint_y=None, height=dp(50), font_size=dp(18))
             self.body = BoxLayout(orientation="vertical", padding=dp(10))
             nav = BoxLayout(size_hint_y=None, height=dp(54))
             nav.add_widget(btn("Live", lambda: self.set_mode("live"), h=54, bg=(0.09, 0.11, 0.15, 1)))
@@ -283,7 +284,7 @@ class SignalApp(App):
     def page(self, title, widgets, keep=False):
         if not keep:
             self.stop_auto()
-        self.head.text = title
+        self.head.text = "%s | %s" % (BRAND, title)
         self.body.clear_widgets()
         g = GridLayout(cols=1, size_hint_y=None, spacing=dp(8))
         g.bind(minimum_height=g.setter("height"))
