@@ -16,9 +16,10 @@ from kivy.uix.gridlayout import GridLayout
 from kivy.uix.label import Label
 from kivy.uix.scrollview import ScrollView
 from kivy.uix.textinput import TextInput
+from kivy.uix.widget import Widget
 from kivy.utils import escape_markup
 
-VERSION = "1.2"
+VERSION = "1.3"
 BRAND = "Eagle X bot"
 SOURCE = "bundled"
 LOAD_ERRORS = []
@@ -30,6 +31,10 @@ GREEN, RED, GREY = "26c281", "ef4b4b", "9aa3b5"
 TICKER_COINS = ["BTC", "ETH", "BNB", "SOL", "XRP", "DOGE", "ADA", "TRX", "AVAX", "LINK", "DOT", "LTC",
                 "BCH", "SHIB", "XLM", "ATOM", "NEAR", "UNI", "TON", "SUI", "PEPE"]
 TICKER_SPEED = 80  # pixels/second (dp), zyada = tez
+TICKER_HEIGHT = 50   # banner ki unchai (bara karna ho to barhayein)
+TICKER_TOP_GAP = 14  # banner ke upar khali jagah (neeche karna ho to barhayein)
+TICKER_FONT = 22     # banner ke text ka size
+TICKER_REFRESH = 15  # seconds
 BINANCE_HOSTS = ["https://api.binance.com", "https://data-api.binance.vision"]
 
 
@@ -108,6 +113,29 @@ def fetch_ticker(symbols):
     order = {c: i for i, c in enumerate(symbols)}
     rows = [{"name": x["symbol"][:-4], "price": float(x["lastPrice"]),
              "chg": float(x["priceChangePercent"])} for x in d]
+    rows.sort(key=lambda r: order.get(r["name"], 999))
+    return rows
+
+
+COINGECKO_IDS = {"BTC": "bitcoin", "ETH": "ethereum", "BNB": "binancecoin", "SOL": "solana", "XRP": "ripple",
+                 "DOGE": "dogecoin", "ADA": "cardano", "TRX": "tron", "AVAX": "avalanche-2", "LINK": "chainlink",
+                 "DOT": "polkadot", "LTC": "litecoin", "BCH": "bitcoin-cash", "SHIB": "shiba-inu",
+                 "XLM": "stellar", "ATOM": "cosmos", "NEAR": "near", "UNI": "uniswap",
+                 "TON": "the-open-network", "SUI": "sui", "PEPE": "pepe"}
+
+
+def fetch_coingecko(symbols):
+    ids = ",".join(COINGECKO_IDS[c] for c in symbols if c in COINGECKO_IDS)
+    d = http_json("https://api.coingecko.com/api/v3/coins/markets",
+                  {"vs_currency": "usd", "ids": ids, "order": "market_cap_desc", "per_page": 50,
+                   "page": 1, "price_change_percentage": "24h"})
+    inv = {v: k for k, v in COINGECKO_IDS.items()}
+    order = {c: i for i, c in enumerate(symbols)}
+    rows = []
+    for x in d:
+        name = inv.get(x["id"], str(x.get("symbol", "")).upper())
+        rows.append({"name": name, "price": float(x["current_price"]),
+                     "chg": float(x.get("price_change_percentage_24h") or 0)})
     rows.sort(key=lambda r: order.get(r["name"], 999))
     return rows
 
@@ -281,7 +309,7 @@ class SignalApp(App):
             root.add_widget(nav)
             self.set_mode("live")
             Clock.schedule_interval(self.scroll, 1 / 30.0)
-            Clock.schedule_interval(lambda dt: self.ticker_job(), 10)
+            Clock.schedule_interval(lambda dt: self.ticker_job(), TICKER_REFRESH)
             Clock.schedule_once(lambda dt: self.ticker_job(), 0.3)
             threading.Thread(target=self.warmup, daemon=True).start()
             return root
@@ -292,19 +320,22 @@ class SignalApp(App):
         self.ticker_ok = False
         self.ticker_busy = False
         self.ticker_syms = list(TICKER_COINS)
-        box = FloatLayout(size_hint_y=None, height=dp(36))
+        wrap = BoxLayout(orientation="vertical", size_hint_y=None, height=dp(TICKER_TOP_GAP + TICKER_HEIGHT))
+        wrap.add_widget(Widget(size_hint_y=None, height=dp(TICKER_TOP_GAP)))
+        box = FloatLayout(size_hint_y=None, height=dp(TICKER_HEIGHT))
         with box.canvas.before:
             Color(0.09, 0.11, 0.15, 1)
             rect = Rectangle(pos=box.pos, size=box.size)
         box.bind(pos=lambda i, v: setattr(rect, "pos", v), size=lambda i, v: setattr(rect, "size", v))
         l = Label(text="Live prices load ho rahe hain...", markup=True, size_hint=(None, 1),
-                  halign="left", valign="middle", font_size=dp(15), text_size=(None, dp(36)))
+                  halign="left", valign="middle", font_size=dp(TICKER_FONT), text_size=(None, dp(TICKER_HEIGHT)))
         l.bind(texture_size=lambda i, v: setattr(i, "width", v[0] + dp(30)))
         box.bind(y=lambda i, v: setattr(l, "y", v))
         l.x = Window.width
         box.add_widget(l)
+        wrap.add_widget(box)
         self.ticker_lbl = l
-        return box
+        return wrap
 
     def scroll(self, dt):
         l = self.ticker_lbl
@@ -318,28 +349,36 @@ class SignalApp(App):
         self.ticker_busy = True
         threading.Thread(target=self.ticker_fetch, daemon=True).start()
 
-    def ticker_fetch(self):
-        text = None
+    def src_binance(self):
         try:
-            try:
-                rows = fetch_ticker(self.ticker_syms)
-            except Exception:
-                allrows = binance("/api/v3/ticker/24hr", {})
-                valid = set(x["symbol"] for x in allrows)
-                self.ticker_syms = [c for c in self.ticker_syms if c + "USDT" in valid] or self.ticker_syms
-                rows = fetch_ticker(self.ticker_syms)
-            text = ticker_text(rows)
+            return fetch_ticker(self.ticker_syms)
         except Exception:
-            text = None
-        self.ticker_busy = False
-        Clock.schedule_once(lambda dt: self.set_ticker(text))
+            allrows = binance("/api/v3/ticker/24hr", {})
+            valid = set(x["symbol"] for x in allrows)
+            self.ticker_syms = [c for c in self.ticker_syms if c + "USDT" in valid] or self.ticker_syms
+            return fetch_ticker(self.ticker_syms)
 
-    def set_ticker(self, text):
+    def ticker_fetch(self):
+        text, errs = None, []
+        for name, fn in (("binance", self.src_binance),
+                         ("coingecko", lambda: fetch_coingecko(self.ticker_syms))):
+            try:
+                rows = fn()
+                if rows:
+                    text = ticker_text(rows)
+                    break
+            except Exception as e:
+                errs.append("%s: %s" % (name, str(e)[:80]))
+        self.ticker_busy = False
+        msg = None if text else "Live prices error - " + " | ".join(errs)
+        Clock.schedule_once(lambda dt: self.set_ticker(text, msg))
+
+    def set_ticker(self, text, msg=None):
         if text:
             self.ticker_lbl.text = text
             self.ticker_ok = True
         elif not self.ticker_ok:
-            self.ticker_lbl.text = "Live prices: internet check karein"
+            self.ticker_lbl.text = escape_markup(msg or "Live prices: internet check karein")
 
     def warmup(self):
         try:
