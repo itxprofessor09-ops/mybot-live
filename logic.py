@@ -20,7 +20,7 @@ from kivy.uix.textinput import TextInput
 from kivy.uix.widget import Widget
 from kivy.utils import escape_markup
 
-VERSION = "1.5"
+VERSION = "1.6"
 BRAND = "Eagle X bot"
 SOURCE = "bundled"
 LOAD_ERRORS = []
@@ -41,18 +41,42 @@ BINANCE_HOSTS = ["https://api.binance.com", "https://data-api.binance.vision"]
 
 
 # ---------------- network ----------------
+_CTX = None
+_REQ_LOCK = threading.Lock()
+
+
+def ssl_ctx():
+    global _CTX
+    if _CTX is None:
+        import ssl
+        try:
+            import certifi
+            _CTX = ssl.create_default_context(cafile=certifi.where())
+        except Exception:
+            _CTX = ssl.create_default_context()
+    return _CTX
+
+
 def http_json(url, params, timeout=15):
+    import urllib.error
+    import urllib.parse
+    import urllib.request
+    q = url + ("?" + urllib.parse.urlencode(params) if params else "")
     try:
-        import requests
-    except ImportError:
-        import urllib.parse
-        import urllib.request
-        q = url + ("?" + urllib.parse.urlencode(params) if params else "")
-        with urllib.request.urlopen(q, timeout=timeout) as f:
-            return json.loads(f.read().decode())
-    r = requests.get(url, params=params, timeout=timeout)
-    r.raise_for_status()
-    return r.json()
+        req = urllib.request.Request(q, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=timeout, context=ssl_ctx()) as f:
+            return json.loads(f.read().decode("utf-8"))
+    except urllib.error.HTTPError:
+        raise  # server ne jawab diya (400/403/451...), dobara try ka faida nahi
+    except Exception as e1:
+        try:
+            with _REQ_LOCK:
+                import requests
+            r = requests.get(url, params=params, timeout=timeout)
+            r.raise_for_status()
+            return r.json()
+        except Exception as e2:
+            raise Exception("%s | requests: %s" % (str(e1)[:60], str(e2)[:40]))
 
 
 def binance(path, params):
@@ -389,7 +413,7 @@ class SignalApp(App):
             Clock.schedule_interval(self.scroll, 1 / 30.0)
             Clock.schedule_interval(lambda dt: self.ticker_job(), 1)
             Clock.schedule_once(lambda dt: self.ticker_job(), 0.3)
-            threading.Thread(target=self.warmup, daemon=True).start()
+            threading.Thread(target=ssl_ctx, daemon=True).start()
             return root
         except Exception:
             return self.err_view(traceback.format_exc())
@@ -408,7 +432,7 @@ class SignalApp(App):
             Color(0.09, 0.11, 0.15, 1)
             rect = Rectangle(pos=box.pos, size=box.size)
         box.bind(pos=lambda i, v: setattr(rect, "pos", v), size=lambda i, v: setattr(rect, "size", v))
-        l = Label(text="Live prices load ho rahe hain...", markup=True, size_hint=(None, 1),
+        l = Label(text="Loading live prices...", markup=True, size_hint=(None, 1),
                   halign="left", valign="middle", font_size=dp(TICKER_FONT), text_size=(None, dp(TICKER_HEIGHT)))
         l.bind(texture_size=lambda i, v: setattr(i, "width", v[0] + dp(30)))
         box.bind(y=lambda i, v: setattr(l, "y", v))
@@ -434,7 +458,7 @@ class SignalApp(App):
             with open(self.prices_path()) as f:
                 rows = json.load(f)["rows"]
             if rows:
-                self.ticker_lbl.text = "[color=9aa3b5]purani prices[/color]        " + ticker_text(rows)
+                self.ticker_lbl.text = "[color=9aa3b5]Last prices[/color]        " + ticker_text(rows)
                 self.ticker_saved = True
         except Exception:
             pass
@@ -493,13 +517,7 @@ class SignalApp(App):
             self.ticker_lbl.text = text
             self.ticker_ok = True
         elif not self.ticker_ok and not self.ticker_saved:
-            self.ticker_lbl.text = "Live prices abhi nahi aa rahe (Settings mein wajah dekhein)"
-
-    def warmup(self):
-        try:
-            import requests  # noqa: F401
-        except Exception:
-            pass
+            self.ticker_lbl.text = "Live prices unavailable - retrying..."
 
     def err_view(self, text):
         sv = ScrollView()
