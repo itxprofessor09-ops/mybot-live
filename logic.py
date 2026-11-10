@@ -2,6 +2,7 @@
 import json
 import os
 import threading
+import time
 import traceback
 
 from kivy.app import App
@@ -19,7 +20,7 @@ from kivy.uix.textinput import TextInput
 from kivy.uix.widget import Widget
 from kivy.utils import escape_markup
 
-VERSION = "1.3"
+VERSION = "1.5"
 BRAND = "Eagle X bot"
 SOURCE = "bundled"
 LOAD_ERRORS = []
@@ -34,21 +35,22 @@ TICKER_SPEED = 80  # pixels/second (dp), zyada = tez
 TICKER_HEIGHT = 50   # banner ki unchai (bara karna ho to barhayein)
 TICKER_TOP_GAP = 14  # banner ke upar khali jagah (neeche karna ho to barhayein)
 TICKER_FONT = 22     # banner ke text ka size
-TICKER_REFRESH = 15  # seconds
+TICKER_FAST = 3       # Binance par har kitne second baad nayi price
+TICKER_SLOW = 8       # backup exchange par (zyada requests ki wajah se)
 BINANCE_HOSTS = ["https://api.binance.com", "https://data-api.binance.vision"]
 
 
 # ---------------- network ----------------
-def http_json(url, params):
+def http_json(url, params, timeout=15):
     try:
         import requests
     except ImportError:
         import urllib.parse
         import urllib.request
-        q = url + "?" + urllib.parse.urlencode(params)
-        with urllib.request.urlopen(q, timeout=15) as f:
+        q = url + ("?" + urllib.parse.urlencode(params) if params else "")
+        with urllib.request.urlopen(q, timeout=timeout) as f:
             return json.loads(f.read().decode())
-    r = requests.get(url, params=params, timeout=15)
+    r = requests.get(url, params=params, timeout=timeout)
     r.raise_for_status()
     return r.json()
 
@@ -107,14 +109,83 @@ def pfmt(x):
     return "{:.8f}".format(x)
 
 
+TT = 6  # ticker request timeout (seconds)
+
+
+def bget(path, params):
+    last = None
+    for h in BINANCE_HOSTS:
+        try:
+            d = http_json(h + path, params, TT)
+            if isinstance(d, dict) and "msg" in d:
+                raise Exception(str(d)[:80])
+            return d
+        except Exception as e:
+            last = e
+    raise Exception(str(last)[:90])
+
+
 def fetch_ticker(symbols):
     syms = json.dumps([c + "USDT" for c in symbols], separators=(",", ":"))
-    d = binance("/api/v3/ticker/24hr", {"symbols": syms})
+    d = bget("/api/v3/ticker/24hr", {"symbols": syms})
     order = {c: i for i, c in enumerate(symbols)}
     rows = [{"name": x["symbol"][:-4], "price": float(x["lastPrice"]),
              "chg": float(x["priceChangePercent"])} for x in d]
     rows.sort(key=lambda r: order.get(r["name"], 999))
     return rows
+
+
+def each(symbols, one):
+    from concurrent.futures import ThreadPoolExecutor
+    errs = []
+
+    def safe(c):
+        try:
+            return one(c)
+        except Exception as e:
+            errs.append(str(e)[:70])
+            return None
+
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        rows = [r for r in ex.map(safe, symbols) if r]
+    if not rows:
+        raise Exception(errs[0] if errs else "no data")
+    return rows
+
+
+def one_binance(c):
+    d = bget("/api/v3/ticker/24hr", {"symbol": c + "USDT"})
+    return {"name": c, "price": float(d["lastPrice"]), "chg": float(d["priceChangePercent"])}
+
+
+def one_okx(c):
+    d = http_json("https://www.okx.com/api/v5/market/ticker", {"instId": c + "-USDT"}, TT)["data"][0]
+    last, op = float(d["last"]), float(d["open24h"])
+    return {"name": c, "price": last, "chg": (last - op) / op * 100 if op else 0.0}
+
+
+def one_kucoin(c):
+    d = http_json("https://api.kucoin.com/api/v1/market/stats", {"symbol": c + "-USDT"}, TT)["data"]
+    return {"name": c, "price": float(d["last"]), "chg": float(d["changeRate"]) * 100}
+
+
+def one_gate(c):
+    d = http_json("https://api.gateio.ws/api/v4/spot/tickers", {"currency_pair": c + "_USDT"}, TT)[0]
+    return {"name": c, "price": float(d["last"]), "chg": float(d["change_percentage"])}
+
+
+def one_bybit(c):
+    d = http_json("https://api.bybit.com/v5/market/tickers", {"category": "spot", "symbol": c + "USDT"}, TT)["result"]["list"][0]
+    return {"name": c, "price": float(d["lastPrice"]), "chg": float(d["price24hPcnt"]) * 100}
+
+
+def src_binance(symbols):
+    try:
+        return fetch_ticker(symbols)
+    except Exception as e:
+        if "400" in str(e) or "Invalid" in str(e):  # koi coin invalid: ek ek karke lo
+            return each(symbols, one_binance)
+        raise
 
 
 COINGECKO_IDS = {"BTC": "bitcoin", "ETH": "ethereum", "BNB": "binancecoin", "SOL": "solana", "XRP": "ripple",
@@ -128,7 +199,7 @@ def fetch_coingecko(symbols):
     ids = ",".join(COINGECKO_IDS[c] for c in symbols if c in COINGECKO_IDS)
     d = http_json("https://api.coingecko.com/api/v3/coins/markets",
                   {"vs_currency": "usd", "ids": ids, "order": "market_cap_desc", "per_page": 50,
-                   "page": 1, "price_change_percentage": "24h"})
+                   "page": 1, "price_change_percentage": "24h"}, TT)
     inv = {v: k for k, v in COINGECKO_IDS.items()}
     order = {c: i for i, c in enumerate(symbols)}
     rows = []
@@ -138,6 +209,13 @@ def fetch_coingecko(symbols):
                      "chg": float(x.get("price_change_percentage_24h") or 0)})
     rows.sort(key=lambda r: order.get(r["name"], 999))
     return rows
+
+
+SOURCES = [("binance", src_binance),
+           ("bybit", lambda s: each(s, one_bybit)),
+           ("okx", lambda s: each(s, one_okx)),
+           ("kucoin", lambda s: each(s, one_kucoin)),
+           ("gate", lambda s: each(s, one_gate))]
 
 
 def ticker_text(rows):
@@ -309,7 +387,7 @@ class SignalApp(App):
             root.add_widget(nav)
             self.set_mode("live")
             Clock.schedule_interval(self.scroll, 1 / 30.0)
-            Clock.schedule_interval(lambda dt: self.ticker_job(), TICKER_REFRESH)
+            Clock.schedule_interval(lambda dt: self.ticker_job(), 1)
             Clock.schedule_once(lambda dt: self.ticker_job(), 0.3)
             threading.Thread(target=self.warmup, daemon=True).start()
             return root
@@ -318,7 +396,10 @@ class SignalApp(App):
 
     def make_ticker(self):
         self.ticker_ok = False
+        self.ticker_saved = False
         self.ticker_busy = False
+        self.ticker_status = "loading"
+        self.ticker_pref = None
         self.ticker_syms = list(TICKER_COINS)
         wrap = BoxLayout(orientation="vertical", size_hint_y=None, height=dp(TICKER_TOP_GAP + TICKER_HEIGHT))
         wrap.add_widget(Widget(size_hint_y=None, height=dp(TICKER_TOP_GAP)))
@@ -335,6 +416,8 @@ class SignalApp(App):
         box.add_widget(l)
         wrap.add_widget(box)
         self.ticker_lbl = l
+        self.ticker_cur, self.ticker_next, self.ticker_probe, self.ticker_last_save = 0, 0.0, 0.0, 0.0
+        self.load_saved()
         return wrap
 
     def scroll(self, dt):
@@ -343,42 +426,74 @@ class SignalApp(App):
         if l.x + l.width < 0:
             l.x = Window.width
 
+    def prices_path(self):
+        return os.path.join(self.user_data_dir, "prices.json")
+
+    def load_saved(self):
+        try:
+            with open(self.prices_path()) as f:
+                rows = json.load(f)["rows"]
+            if rows:
+                self.ticker_lbl.text = "[color=9aa3b5]purani prices[/color]        " + ticker_text(rows)
+                self.ticker_saved = True
+        except Exception:
+            pass
+
+    def save_prices(self, rows):
+        if time.time() - self.ticker_last_save < 10:
+            return
+        self.ticker_last_save = time.time()
+        try:
+            os.makedirs(self.user_data_dir, exist_ok=True)
+            with open(self.prices_path(), "w") as f:
+                json.dump({"t": time.time(), "rows": rows}, f)
+        except Exception:
+            pass
+
     def ticker_job(self):
-        if self.ticker_busy:
+        if self.ticker_busy or time.time() < self.ticker_next:
             return
         self.ticker_busy = True
         threading.Thread(target=self.ticker_fetch, daemon=True).start()
 
-    def src_binance(self):
-        try:
-            return fetch_ticker(self.ticker_syms)
-        except Exception:
-            allrows = binance("/api/v3/ticker/24hr", {})
-            valid = set(x["symbol"] for x in allrows)
-            self.ticker_syms = [c for c in self.ticker_syms if c + "USDT" in valid] or self.ticker_syms
-            return fetch_ticker(self.ticker_syms)
-
     def ticker_fetch(self):
-        text, errs = None, []
-        for name, fn in (("binance", self.src_binance),
-                         ("coingecko", lambda: fetch_coingecko(self.ticker_syms))):
+        # Pattern: Binance pehle -> fail ho to Bybit -> phir baaqi. Har 60s baad Binance dobara try (failback).
+        names = [n for n, _ in SOURCES]
+        order = list(range(len(SOURCES)))
+        seq = order[self.ticker_cur:] + order[:self.ticker_cur]
+        if self.ticker_cur != 0 and time.time() - self.ticker_probe > 60:
+            self.ticker_probe = time.time()
+            seq = [0] + [i for i in seq if i != 0]
+        rows, used, errs = None, None, []
+        for i in seq:
             try:
-                rows = fn()
-                if rows:
-                    text = ticker_text(rows)
+                r = SOURCES[i][1](self.ticker_syms)
+                if r:
+                    rows, used = r, i
                     break
             except Exception as e:
-                errs.append("%s: %s" % (name, str(e)[:80]))
+                errs.append("%s: %s" % (names[i], str(e)[:60]))
+        text = None
+        if rows:
+            if used != 0 and self.ticker_cur == 0:
+                self.ticker_probe = time.time()
+            self.ticker_cur = used
+            self.ticker_status = "source: " + names[used] + ((" | " + " | ".join(errs)) if errs else "")
+            text = ticker_text(rows) + "        [color=9aa3b5]via %s[/color]" % names[used].upper()
+            self.ticker_next = time.time() + (TICKER_FAST if used == 0 else TICKER_SLOW)
+            self.save_prices(rows)
+        else:
+            self.ticker_status = "error - " + " | ".join(errs)
+            self.ticker_next = time.time() + 5
         self.ticker_busy = False
-        msg = None if text else "Live prices error - " + " | ".join(errs)
-        Clock.schedule_once(lambda dt: self.set_ticker(text, msg))
+        Clock.schedule_once(lambda dt: self.set_ticker(text, None))
 
     def set_ticker(self, text, msg=None):
         if text:
             self.ticker_lbl.text = text
             self.ticker_ok = True
-        elif not self.ticker_ok:
-            self.ticker_lbl.text = escape_markup(msg or "Live prices: internet check karein")
+        elif not self.ticker_ok and not self.ticker_saved:
+            self.ticker_lbl.text = "Live prices abhi nahi aa rahe (Settings mein wajah dekhein)"
 
     def warmup(self):
         try:
@@ -474,6 +589,7 @@ class SignalApp(App):
         info = "Version %s | source: %s" % (VERSION, SOURCE)
         if LOAD_ERRORS:
             info += "\n" + escape_markup("; ".join(LOAD_ERRORS))
+        info += "\nPrices: " + escape_markup(str(getattr(self, "ticker_status", "-")))
         self.page("Settings", [lbl("Forex ke liye twelvedata.com se free API key lein aur yahan paste karein. "
                                    "Crypto ke liye key nahi chahiye.", 14), ti, btn("Save", save),
                                lbl(info, 12)])
